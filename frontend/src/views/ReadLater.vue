@@ -44,18 +44,86 @@
       </div>
     </div>
 
+    <div class="batch-toolbar">
+      <el-checkbox
+        :model-value="allPageChecked"
+        :indeterminate="pageIndeterminate"
+        :disabled="readLaterStore.links.length === 0"
+        @change="toggleSelectAllPage"
+      >
+        全选本屏
+      </el-checkbox>
+      <span class="selection-count">
+        已选 {{ readLaterStore.selectedCount }} 条
+        <el-button
+          v-if="readLaterStore.selectedCount > 0"
+          link
+          type="primary"
+          size="small"
+          @click="readLaterStore.clearSelection()"
+        >
+          清除选择
+        </el-button>
+      </span>
+      <div class="batch-actions">
+        <el-button
+          size="small"
+          :disabled="readLaterStore.selectedCount === 0"
+          :loading="readLaterStore.batchLoading"
+          @click="openBatchDateDialog"
+        >
+          改回顾日期
+        </el-button>
+        <el-button
+          size="small"
+          :disabled="readLaterStore.selectedCount === 0"
+          :loading="readLaterStore.batchLoading"
+          @click="executeBatch('set_status', { review_status: 'completed' }, '标记为已回顾')"
+        >
+          标记已回顾
+        </el-button>
+        <el-button
+          size="small"
+          :disabled="readLaterStore.selectedCount === 0"
+          :loading="readLaterStore.batchLoading"
+          @click="executeBatch('set_status', { review_status: 'skipped' }, '标记为已跳过')"
+        >
+          标记已跳过
+        </el-button>
+        <el-button
+          size="small"
+          type="danger"
+          plain
+          :disabled="readLaterStore.selectedCount === 0"
+          :loading="readLaterStore.batchLoading"
+          @click="confirmBatchRemove"
+        >
+          移出稍后阅读
+        </el-button>
+      </div>
+    </div>
+
     <div v-loading="readLaterStore.loading" class="links-grid">
       <div
         v-for="link in readLaterStore.links"
         :key="link.id"
         class="read-later-card"
-        :class="'status-' + link.review_status"
+        :class="['status-' + link.review_status, { selected: readLaterStore.selectedIds.has(link.id) }]"
+        @click="readLaterStore.toggleSelected(link.id)"
       >
         <div class="card-header">
-          <div class="status-badge" :class="link.review_status">
-            {{ getStatusText(link.review_status) }}
+          <div class="card-header-left">
+            <el-checkbox
+              :model-value="readLaterStore.selectedIds.has(link.id)"
+              class="card-checkbox"
+              @click.stop
+              @change="readLaterStore.toggleSelected(link.id)"
+            />
+            <div class="status-badge" :class="link.review_status">
+              {{ getStatusText(link.review_status) }}
+            </div>
           </div>
-          <div class="card-actions">
+          <div class="card-actions" @click.stop>
             <el-dropdown @command="(cmd) => handleStatusChange(link, cmd)" trigger="click">
               <el-button size="small" text>
                 <el-icon><MoreFilled /></el-icon>
@@ -80,7 +148,7 @@
           </div>
         </div>
 
-        <a :href="link.url" target="_blank" class="card-title">
+        <a :href="link.url" target="_blank" class="card-title" @click.stop>
           {{ link.title }}
         </a>
 
@@ -151,12 +219,43 @@
         <el-button type="primary" @click="saveSchedule">保存</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="batchDateDialogVisible" title="批量设置回顾日期" width="400px">
+      <div class="schedule-form">
+        <p class="batch-hint">将为已选的 {{ readLaterStore.selectedCount }} 条链接统一设置回顾日期</p>
+        <el-form-item label="回顾日期">
+          <el-date-picker
+            v-model="batchScheduleDate"
+            type="date"
+            placeholder="选择回顾日期"
+            style="width: 100%"
+            :disabled-date="disabledDate"
+          />
+        </el-form-item>
+        <div class="quick-options">
+          <el-button size="small" @click="setBatchQuickDate(1)">明天</el-button>
+          <el-button size="small" @click="setBatchQuickDate(3)">3天后</el-button>
+          <el-button size="small" @click="setBatchQuickDate(7)">1周后</el-button>
+          <el-button size="small" @click="setBatchQuickDate(30)">1月后</el-button>
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="batchDateDialogVisible = false">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="readLaterStore.batchLoading"
+          @click="saveBatchDate"
+        >
+          应用到 {{ readLaterStore.selectedCount }} 条
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ref, computed, h, onMounted } from 'vue'
+import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import { Document, Clock, CircleCheck, CircleClose, MoreFilled, Calendar, Edit } from '@element-plus/icons-vue'
 import { useReadLaterStore } from '../stores/readLater'
 import { linksApi } from '../api'
@@ -167,9 +266,25 @@ const scheduleDialogVisible = ref(false)
 const scheduleDate = ref(null)
 const currentLink = ref(null)
 
+const batchDateDialogVisible = ref(false)
+const batchScheduleDate = ref(null)
+
+const pageIds = computed(() => readLaterStore.links.map((l) => l.id))
+const allPageChecked = computed(
+  () => pageIds.value.length > 0 && pageIds.value.every((id) => readLaterStore.selectedIds.has(id))
+)
+const pageIndeterminate = computed(() => {
+  const checkedOnPage = pageIds.value.filter((id) => readLaterStore.selectedIds.has(id)).length
+  return checkedOnPage > 0 && checkedOnPage < pageIds.value.length
+})
+
 onMounted(() => {
   readLaterStore.fetchReadLater()
 })
+
+function toggleSelectAllPage(checked) {
+  readLaterStore.setPageSelection(pageIds.value, checked)
+}
 
 function getStatusText(status) {
   const map = {
@@ -252,6 +367,96 @@ async function saveSchedule() {
 
 function handlePageChange(page) {
   readLaterStore.fetchReadLater(page)
+}
+
+const FAILURE_REASONS = {
+  not_in_scope: '已不在稍后阅读列表（可能已被移除）',
+  out_of_scope: '状态已变化，不在当前范围内',
+  failed: '服务端处理失败',
+}
+
+// Batch operations report per-item results. Successful ids (and ids that
+// already left the scope on a previous run) are pruned from the selection;
+// only genuine failures stay checked so the user can retry them directly.
+function reportBatchResult(data) {
+  const { summary, results } = data
+  const failedResults = results.filter((r) => !r.success)
+  const realFailures = failedResults.filter((r) => r.code === 'failed')
+  const excluded = failedResults.filter((r) => r.code !== 'failed')
+
+  const titleOf = (id) => readLaterStore.links.find((l) => l.id === id)?.title || `#${id}`
+
+  if (summary.succeeded > 0 && failedResults.length === 0) {
+    ElMessage.success(`操作完成：成功 ${summary.succeeded} 条`)
+    return
+  }
+
+  ElNotification({
+    title: `批量操作完成：成功 ${summary.succeeded} 条，失败 ${summary.failed} 条`,
+    type: realFailures.length > 0 ? 'warning' : 'info',
+    duration: 6000,
+    message: h('div', { class: 'batch-result' }, [
+      h('p', null, `共 ${summary.total} 条：成功 ${summary.succeeded} 条${
+        excluded.length > 0 ? `，${excluded.length} 条已不在当前范围` : ''
+      }${realFailures.length > 0 ? `，失败 ${realFailures.length} 条（仍保持勾选，可重试）` : ''}`),
+      ...failedResults.slice(0, 10).map((r) =>
+        h('p', { class: 'batch-failed-item' }, `• ${titleOf(r.id)}：${FAILURE_REASONS[r.code] || '操作失败'}`)
+      ),
+      failedResults.length > 10
+        ? h('p', { class: 'batch-failed-more' }, `…还有 ${failedResults.length - 10} 条`)
+        : null,
+    ]),
+  })
+}
+
+async function executeBatch(action, payload, confirmText) {
+  if (readLaterStore.selectedCount === 0) return
+  try {
+    const data = await readLaterStore.batchReview(action, payload)
+    if (data) reportBatchResult(data)
+  } catch (error) {
+    console.error(`${confirmText}失败:`, error)
+    ElMessage.error(error.response?.data?.error || `${confirmText}失败，已选条目保持勾选，可重试`)
+  }
+}
+
+async function confirmBatchRemove() {
+  const count = readLaterStore.selectedCount
+  if (count === 0) return
+  try {
+    await ElMessageBox.confirm(
+      `确定要将选中的 ${count} 条链接从稍后阅读移除吗？`,
+      '确认批量移除',
+      { type: 'warning' }
+    )
+    await executeBatch('remove', {}, '批量移除')
+  } catch (err) {
+    if (err !== 'cancel') {
+      ElMessage.error('操作失败')
+    }
+  }
+}
+
+function openBatchDateDialog() {
+  if (readLaterStore.selectedCount === 0) return
+  batchScheduleDate.value = null
+  batchDateDialogVisible.value = true
+}
+
+function setBatchQuickDate(days) {
+  const date = new Date()
+  date.setDate(date.getDate() + days)
+  batchScheduleDate.value = date
+}
+
+async function saveBatchDate() {
+  if (!batchScheduleDate.value) {
+    ElMessage.warning('请选择回顾日期')
+    return
+  }
+  const review_date = batchScheduleDate.value.toISOString().split('T')[0]
+  batchDateDialogVisible.value = false
+  await executeBatch('set_date', { review_date }, '批量修改回顾日期')
 }
 </script>
 
@@ -351,6 +556,75 @@ function handlePageChange(page) {
   grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
   gap: 16px;
   min-height: 200px;
+}
+
+.batch-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  background: #fff;
+  border-radius: 12px;
+  border: 1px solid #ebeef5;
+  flex-wrap: wrap;
+}
+
+.selection-count {
+  font-size: 13px;
+  color: #606266;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.batch-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.read-later-card {
+  cursor: pointer;
+}
+
+.read-later-card.selected {
+  border-color: #409eff;
+  box-shadow: 0 0 0 1px #409eff;
+  background: #f5faff;
+}
+
+.card-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.card-checkbox {
+  height: auto;
+}
+
+.batch-hint {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: #909399;
+}
+
+.batch-result {
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.batch-failed-item {
+  margin: 4px 0 0;
+  color: #e6a23c;
+  word-break: break-all;
+}
+
+.batch-failed-more {
+  margin: 4px 0 0;
+  color: #909399;
 }
 
 .read-later-card {

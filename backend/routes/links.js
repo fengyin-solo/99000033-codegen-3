@@ -197,6 +197,136 @@ router.get('/read-later', (req, res) => {
   });
 });
 
+// POST /api/links/read-later/batch - Batch review operations
+// Each link is validated and processed independently so that one failure
+// does not abort the rest. `scope_status` mirrors the list filter, so the
+// server enforces the exact same range the user is looking at: links that
+// were changed elsewhere (refresh / reopen) and therefore left the scope
+// are rejected instead of being silently processed a second time.
+router.post('/read-later/batch', (req, res) => {
+  const { link_ids, action, review_date, review_status, scope_status } = req.body;
+  const userId = req.userId;
+
+  if (!Array.isArray(link_ids)) {
+    return res.status(400).json({ error: 'link_ids must be an array' });
+  }
+
+  const ids = [...new Set(link_ids)]
+    .map((id) => Number(id))
+    .filter((id) => Number.isInteger(id));
+
+  if (ids.length === 0) {
+    return res.status(400).json({ error: 'No valid link ids provided' });
+  }
+  if (ids.length > 100) {
+    return res.status(400).json({ error: 'Cannot process more than 100 links at once' });
+  }
+
+  const validActions = ['set_status', 'set_date', 'remove'];
+  if (!validActions.includes(action)) {
+    return res.status(400).json({ error: 'Invalid action' });
+  }
+
+  const validStatuses = ['pending', 'completed', 'skipped'];
+  const listStatuses = [...validStatuses, 'all'];
+  const filterStatus = listStatuses.includes(scope_status) ? scope_status : 'all';
+
+  let targetStatus = null;
+  let targetDate = null;
+
+  if (action === 'set_status') {
+    targetStatus = review_status;
+    if (!validStatuses.includes(targetStatus)) {
+      return res.status(400).json({ error: 'Invalid review status' });
+    }
+  }
+
+  if (action === 'set_date') {
+    targetDate = review_date;
+    if (targetDate !== null) {
+      if (typeof targetDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(targetDate)
+        || Number.isNaN(Date.parse(targetDate))) {
+        return res.status(400).json({ error: 'Invalid review date, expected YYYY-MM-DD' });
+      }
+    }
+  }
+
+  const db = getDb();
+
+  const findStmt = db.prepare('SELECT * FROM links WHERE id = ? AND user_id = ?');
+  const setStatusStmt = db.prepare('UPDATE links SET review_status = ? WHERE id = ?');
+  const setDateStmt = db.prepare('UPDATE links SET review_date = ? WHERE id = ?');
+  const removeStmt = db.prepare(`
+    UPDATE links
+    SET is_read_later = 0, review_date = NULL, review_status = 'pending'
+    WHERE id = ?
+  `);
+
+  const processOne = db.transaction((id) => {
+    const link = findStmt.get(id, userId);
+
+    if (!link || !link.is_read_later) {
+      // Belongs to another user, deleted, or already removed from the list.
+      return { id, success: false, code: 'not_in_scope' };
+    }
+
+    if (filterStatus !== 'all' && link.review_status !== filterStatus) {
+      // Its status changed since the list was loaded (e.g. after a refresh);
+      // it no longer belongs to the screen this batch was started from.
+      return { id, success: false, code: 'out_of_scope' };
+    }
+
+    if (action === 'set_status') {
+      // Setting the same status is idempotent and counts as success, so a
+      // retried batch never reports a failure for already-applied items.
+      setStatusStmt.run(targetStatus, id);
+    } else if (action === 'set_date') {
+      setDateStmt.run(targetDate, id);
+    } else {
+      removeStmt.run(id);
+    }
+
+    return { id, success: true };
+  });
+
+  const results = ids.map((id) => {
+    try {
+      return processOne(id);
+    } catch (err) {
+      return { id, success: false, code: 'failed' };
+    }
+  });
+
+  const succeeded = results.filter((r) => r.success);
+  const failed = results.filter((r) => !r.success);
+
+  // Recompute stats over the same set as the list endpoint so the top
+  // counters always agree with the list contents.
+  const statsResult = db.prepare(`
+    SELECT review_status, COUNT(*) as count
+    FROM links
+    WHERE user_id = ? AND is_read_later = 1
+    GROUP BY review_status
+  `).all(userId);
+  const stats = { pending: 0, completed: 0, skipped: 0, total: 0 };
+  statsResult.forEach((s) => {
+    stats[s.review_status] = s.count;
+    stats.total += s.count;
+  });
+
+  res.json({
+    action,
+    results,
+    summary: {
+      total: ids.length,
+      succeeded: succeeded.length,
+      failed: failed.length,
+      excluded: failed.filter((r) => r.code !== 'failed').length,
+    },
+    stats,
+  });
+});
+
 // POST /api/links/:id/read-later - Add link to read later
 router.post('/:id/read-later', (req, res) => {
   const { id } = req.params;
